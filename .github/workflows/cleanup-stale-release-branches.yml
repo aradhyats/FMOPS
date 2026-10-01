@@ -53,6 +53,8 @@ jobs:
     steps:
       - name: Find and clean up stale release branches
         uses: actions/github-script@v7
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         with:
           script: |
             const pattern = process.env.BRANCH_PATTERN;
@@ -145,14 +147,69 @@ jobs:
             await summary.write();
 
             const deleted = results.filter(r => r.status === 'deleted');
+            const kept = results.filter(r => r.status === 'kept');
+            const skipped = results.filter(r => r.status === 'skipped');
+            const wouldDelete = results.filter(r => r.status === 'would-delete');
             const errors = results.filter(r => r.status === 'error');
             core.info(`Matched ${results.length} branch(es). Deleted: ${deleted.length}. Errors: ${errors.length}.`);
+
+            // Post a Slack update for every run (not just failures), including which
+            // branches were actually deleted. Silently skipped if no webhook is set.
+            const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+            if (!webhookUrl) {
+              core.info('SLACK_WEBHOOK_URL not set - skipping Slack notification.');
+            } else {
+              const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+              const headline = errors.length > 0
+                ? ':rotating_light: Release branch cleanup *completed with errors*'
+                : `:white_check_mark: Release branch cleanup ${dryRun ? '(dry run) ' : ''}completed`;
+
+              const lines = [
+                `${headline} in \`${owner}/${repo}\``,
+                `Mode: ${dryRun ? 'DRY RUN' : 'LIVE'} | Pattern: \`${pattern}\` | Threshold: ${inactivityDays} days`,
+                `Matched: ${results.length} | Deleted: ${deleted.length} | Would-delete: ${wouldDelete.length} | Kept: ${kept.length} | Skipped: ${skipped.length} | Errors: ${errors.length}`,
+              ];
+
+              if (deleted.length > 0) {
+                lines.push('*Deleted branches:*');
+                lines.push(deleted.map(r => `• \`${r.name}\` (inactive ${r.ageDays} days)`).join('\n'));
+              } else if (!dryRun) {
+                lines.push('_No branches were deleted this run._');
+              }
+
+              if (wouldDelete.length > 0) {
+                lines.push('*Would delete (dry run):*');
+                lines.push(wouldDelete.map(r => `• \`${r.name}\` (inactive ${r.ageDays} days)`).join('\n'));
+              }
+
+              if (errors.length > 0) {
+                lines.push('*Errors:*');
+                lines.push(errors.map(r => `• \`${r.name}\`: ${r.reason}`).join('\n'));
+              }
+
+              lines.push(`<${runUrl}|View full run details>`);
+
+              try {
+                const resp = await fetch(webhookUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: lines.join('\n') }),
+                });
+                if (!resp.ok) {
+                  core.warning(`Slack notification returned ${resp.status}: ${await resp.text()}`);
+                }
+              } catch (slackErr) {
+                core.warning(`Slack notification failed: ${slackErr.message || slackErr}`);
+              }
+            }
 
             if (errors.length > 0) {
               core.setFailed(`${errors.length} branch deletion(s) failed unexpectedly - see job summary for details.`);
             }
 
-      - name: Notify Slack on failure
+      # Fallback only: covers a catastrophic failure in the step above (e.g. API/auth
+      # error) that crashes before it reaches its own inline Slack notification.
+      - name: Notify Slack on job-level failure
         if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
