@@ -1,0 +1,166 @@
+name: Cleanup Stale Release Branches
+
+# FMOPS-3389: delete release branches with no commits in the last 12 months.
+# The repo's default branch is always skipped. Tags are never touched.
+#
+# Safe to test: run this manually from the Actions tab first (dry_run defaults
+# to true there, and you can narrow branch_pattern to a single test branch).
+# The scheduled run always deletes for real — only enable/trust it once a
+# manual dry run and a manual live test on one branch both look right.
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of every month
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (report only, delete nothing)"
+        type: boolean
+        default: true
+      branch_pattern:
+        description: "Glob for release branches (supports * wildcard)"
+        type: string
+        default: "releases/*"
+      exclude_branches:
+        description: "Comma-separated branch names to always keep"
+        type: string
+        default: "dev,main,master"
+      inactivity_days:
+        description: "Days of inactivity before a branch is eligible for deletion"
+        type: number
+        default: 365
+      max_deletions:
+        description: "Safety cap on deletions in one run (0 = unlimited)"
+        type: number
+        default: 0
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup-release-branches:
+    runs-on: ubuntu-latest
+    env:
+      # On a scheduled run there is no `inputs` object, so DRY_RUN falls back
+      # to 'false' (real cleanup). On workflow_dispatch it takes whatever the
+      # form/API call supplied, defaulting to 'true' via the input's own default.
+      DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || github.event.inputs.dry_run }}
+      BRANCH_PATTERN: ${{ github.event.inputs.branch_pattern || 'releases/*' }}
+      EXCLUDE_BRANCHES: ${{ github.event.inputs.exclude_branches || 'dev,main,master' }}
+      INACTIVITY_DAYS: ${{ github.event.inputs.inactivity_days || '365' }}
+      MAX_DELETIONS: ${{ github.event.inputs.max_deletions || '0' }}
+    steps:
+      - name: Find and clean up stale release branches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pattern = process.env.BRANCH_PATTERN;
+            const excludeList = process.env.EXCLUDE_BRANCHES.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+            const inactivityDays = parseInt(process.env.INACTIVITY_DAYS, 10);
+            const dryRun = process.env.DRY_RUN === 'true';
+            const maxDeletions = parseInt(process.env.MAX_DELETIONS, 10);
+
+            const { owner, repo } = context.repo;
+
+            const repoInfo = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.data.default_branch;
+
+            const escaped = pattern.split('*').map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*');
+            const patternRegex = new RegExp('^' + escaped + '$');
+
+            const branches = await github.paginate(github.rest.repos.listBranches, { owner, repo, per_page: 100 });
+            const cutoff = Date.now() - inactivityDays * 24 * 60 * 60 * 1000;
+
+            const results = [];
+            let deletions = 0;
+
+            for (const b of branches) {
+              const name = b.name;
+
+              if (name === defaultBranch) continue;
+              if (excludeList.includes(name.toLowerCase())) continue;
+              if (!patternRegex.test(name)) continue;
+
+              const commit = await github.rest.repos.getCommit({ owner, repo, ref: b.commit.sha });
+              const commitDateStr = commit.data.commit.committer.date || commit.data.commit.author.date;
+              const lastDate = new Date(commitDateStr);
+              const ageDays = Math.floor((Date.now() - lastDate.getTime()) / (24 * 60 * 60 * 1000));
+
+              if (lastDate.getTime() > cutoff) {
+                results.push({ name, lastDate: commitDateStr, ageDays, status: 'kept', reason: `active within ${inactivityDays} days` });
+                continue;
+              }
+
+              if (dryRun) {
+                results.push({ name, lastDate: commitDateStr, ageDays, status: 'would-delete', reason: 'dry run' });
+                continue;
+              }
+
+              if (maxDeletions > 0 && deletions >= maxDeletions) {
+                results.push({ name, lastDate: commitDateStr, ageDays, status: 'skipped', reason: 'max_deletions cap reached' });
+                continue;
+              }
+
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${name}` });
+                deletions++;
+                results.push({ name, lastDate: commitDateStr, ageDays, status: 'deleted', reason: `inactive > ${inactivityDays} days` });
+              } catch (e) {
+                const msg = e.message || String(e);
+                if (e.status === 404 || e.status === 422 || /protected/i.test(msg)) {
+                  results.push({ name, lastDate: commitDateStr, ageDays, status: 'skipped', reason: `could not delete (likely branch protection): ${msg}` });
+                  core.warning(`Skipped ${name}: ${msg}`);
+                } else {
+                  results.push({ name, lastDate: commitDateStr, ageDays, status: 'error', reason: msg });
+                  core.error(`Failed to delete ${name}: ${msg}`);
+                }
+              }
+            }
+
+            const summary = core.summary
+              .addHeading('Release Branch Cleanup')
+              .addRaw(
+                `**Mode:** ${dryRun ? 'DRY RUN (no branches deleted)' : 'LIVE'}  \n` +
+                `**Pattern:** \`${pattern}\`  \n` +
+                `**Inactivity threshold:** ${inactivityDays} days  \n` +
+                `**Always kept:** ${defaultBranch} (default), ${excludeList.join(', ')}  \n\n`
+              );
+
+            if (results.length === 0) {
+              summary.addRaw('No branches matched the pattern (after exclusions).\n');
+            } else {
+              const rows = [[
+                { data: 'Branch', header: true },
+                { data: 'Last commit', header: true },
+                { data: 'Age (days)', header: true },
+                { data: 'Status', header: true },
+                { data: 'Reason', header: true },
+              ]];
+              for (const r of results) {
+                rows.push([r.name, r.lastDate.split('T')[0], String(r.ageDays), r.status, r.reason]);
+              }
+              summary.addTable(rows);
+            }
+            await summary.write();
+
+            const deleted = results.filter(r => r.status === 'deleted');
+            const errors = results.filter(r => r.status === 'error');
+            core.info(`Matched ${results.length} branch(es). Deleted: ${deleted.length}. Errors: ${errors.length}.`);
+
+            if (errors.length > 0) {
+              core.setFailed(`${errors.length} branch deletion(s) failed unexpectedly - see job summary for details.`);
+            }
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::notice::SLACK_WEBHOOK_URL secret not set - skipping Slack notification. Failure is still visible in the Actions tab."
+            exit 0
+          fi
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rotating_light: Release branch cleanup workflow *failed* in ${{ github.repository }} (run <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>). Please investigate.\"}" \
+            "$SLACK_WEBHOOK_URL"
