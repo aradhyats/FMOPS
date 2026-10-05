@@ -3,10 +3,18 @@ name: Cleanup Stale Release Branches
 # FMOPS-3389: delete release branches with no commits in the last 12 months.
 # The repo's default branch is always skipped. Tags are never touched.
 #
-# Safe to test: run this manually from the Actions tab first (dry_run defaults
-# to true there, and you can narrow branch_pattern to a single test branch).
-# The scheduled run always deletes for real — only enable/trust it once a
-# manual dry run and a manual live test on one branch both look right.
+# Two-stage, approval-gated design:
+#   1. `plan` always runs first: scans branches, posts the candidate list to
+#      Slack and the Job Summary, but NEVER deletes anything itself.
+#   2. `apply` only runs when there is something to delete AND it is not a
+#      dry run. It is gated behind the `release-branch-cleanup-approval`
+#      GitHub Environment, which requires a human reviewer to approve the
+#      run (Actions tab -> "Review deployments") before anything is
+#      actually deleted - including on the automatic monthly schedule.
+#
+# One-time setup needed: create an Environment named
+# `release-branch-cleanup-approval` in Settings -> Environments, with
+# "Required reviewers" turned on and the right people/team added.
 
 on:
   schedule:
@@ -35,23 +43,25 @@ on:
         type: number
         default: 0
 
-permissions:
-  contents: write
-
 jobs:
-  cleanup-release-branches:
+  plan:
+    name: Scan for stale release branches
     runs-on: ubuntu-latest
     env:
       # On a scheduled run there is no `inputs` object, so DRY_RUN falls back
-      # to 'false' (real cleanup). On workflow_dispatch it takes whatever the
-      # form/API call supplied, defaulting to 'true' via the input's own default.
+      # to 'false' (real cleanup, pending approval). On workflow_dispatch it
+      # takes whatever the form/API call supplied, defaulting to 'true'.
       DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || github.event.inputs.dry_run }}
       BRANCH_PATTERN: ${{ github.event.inputs.branch_pattern || 'releases/*' }}
       EXCLUDE_BRANCHES: ${{ github.event.inputs.exclude_branches || 'dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20' }}
       INACTIVITY_DAYS: ${{ github.event.inputs.inactivity_days || '365' }}
       MAX_DELETIONS: ${{ github.event.inputs.max_deletions || '0' }}
+    outputs:
+      dry_run: ${{ steps.scan.outputs.dry_run }}
+      candidates: ${{ steps.scan.outputs.candidates }}
     steps:
-      - name: Find and clean up stale release branches
+      - name: Scan branches (no deletions happen here)
+        id: scan
         uses: actions/github-script@v7
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -75,7 +85,7 @@ jobs:
             const cutoff = Date.now() - inactivityDays * 24 * 60 * 60 * 1000;
 
             const results = [];
-            let deletions = 0;
+            let candidateCount = 0;
 
             for (const b of branches) {
               const name = b.name;
@@ -90,40 +100,25 @@ jobs:
               const ageDays = Math.floor((Date.now() - lastDate.getTime()) / (24 * 60 * 60 * 1000));
 
               if (lastDate.getTime() > cutoff) {
-                results.push({ name, lastDate: commitDateStr, ageDays, status: 'kept', reason: `active within ${inactivityDays} days` });
+                results.push({ name, ageDays, status: 'kept', reason: `active within ${inactivityDays} days` });
                 continue;
               }
 
-              if (dryRun) {
-                results.push({ name, lastDate: commitDateStr, ageDays, status: 'would-delete', reason: 'dry run' });
+              if (maxDeletions > 0 && candidateCount >= maxDeletions) {
+                results.push({ name, ageDays, status: 'skipped', reason: 'max_deletions cap reached' });
                 continue;
               }
 
-              if (maxDeletions > 0 && deletions >= maxDeletions) {
-                results.push({ name, lastDate: commitDateStr, ageDays, status: 'skipped', reason: 'max_deletions cap reached' });
-                continue;
-              }
-
-              try {
-                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${name}` });
-                deletions++;
-                results.push({ name, lastDate: commitDateStr, ageDays, status: 'deleted', reason: `inactive > ${inactivityDays} days` });
-              } catch (e) {
-                const msg = e.message || String(e);
-                if (e.status === 404 || e.status === 422 || /protected/i.test(msg)) {
-                  results.push({ name, lastDate: commitDateStr, ageDays, status: 'skipped', reason: `could not delete (likely branch protection): ${msg}` });
-                  core.warning(`Skipped ${name}: ${msg}`);
-                } else {
-                  results.push({ name, lastDate: commitDateStr, ageDays, status: 'error', reason: msg });
-                  core.error(`Failed to delete ${name}: ${msg}`);
-                }
-              }
+              candidateCount++;
+              results.push({ name, ageDays, status: 'candidate', reason: `inactive > ${inactivityDays} days` });
             }
 
+            const candidates = results.filter(r => r.status === 'candidate');
+
             const summary = core.summary
-              .addHeading('Release Branch Cleanup')
+              .addHeading('Release Branch Cleanup - Plan')
               .addRaw(
-                `**Mode:** ${dryRun ? 'DRY RUN (no branches deleted)' : 'LIVE'}  \n` +
+                `**Mode:** ${dryRun ? 'DRY RUN' : 'LIVE - pending approval'}  \n` +
                 `**Pattern:** \`${pattern}\`  \n` +
                 `**Inactivity threshold:** ${inactivityDays} days  \n` +
                 `**Always kept:** ${defaultBranch} (default), ${excludeList.join(', ')}  \n\n`
@@ -134,60 +129,46 @@ jobs:
             } else {
               const rows = [[
                 { data: 'Branch', header: true },
-                { data: 'Last commit', header: true },
                 { data: 'Age (days)', header: true },
                 { data: 'Status', header: true },
                 { data: 'Reason', header: true },
               ]];
               for (const r of results) {
-                rows.push([r.name, r.lastDate.split('T')[0], String(r.ageDays), r.status, r.reason]);
+                rows.push([r.name, String(r.ageDays), r.status, r.reason]);
               }
               summary.addTable(rows);
             }
             await summary.write();
 
-            const deleted = results.filter(r => r.status === 'deleted');
-            const kept = results.filter(r => r.status === 'kept');
-            const skipped = results.filter(r => r.status === 'skipped');
-            const wouldDelete = results.filter(r => r.status === 'would-delete');
-            const errors = results.filter(r => r.status === 'error');
-            core.info(`Matched ${results.length} branch(es). Deleted: ${deleted.length}. Errors: ${errors.length}.`);
+            core.info(`Found ${candidates.length} candidate(s) for deletion.`);
+            core.setOutput('candidates', JSON.stringify(candidates.map(c => c.name)));
+            core.setOutput('dry_run', dryRun ? 'true' : 'false');
 
-            // Post a Slack update for every run (not just failures), including which
-            // branches were actually deleted. Silently skipped if no webhook is set.
             const webhookUrl = process.env.SLACK_WEBHOOK_URL;
             if (!webhookUrl) {
               core.info('SLACK_WEBHOOK_URL not set - skipping Slack notification.');
             } else {
               const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-              const headline = errors.length > 0
-                ? ':rotating_light: Release branch cleanup *completed with errors*'
-                : `:white_check_mark: Release branch cleanup ${dryRun ? '(dry run) ' : ''}completed`;
+              const lines = [];
 
-              const lines = [
-                `${headline} in \`${owner}/${repo}\``,
-                `Mode: ${dryRun ? 'DRY RUN' : 'LIVE'} | Pattern: \`${pattern}\` | Threshold: ${inactivityDays} days`,
-                `Matched: ${results.length} | Deleted: ${deleted.length} | Would-delete: ${wouldDelete.length} | Kept: ${kept.length} | Skipped: ${skipped.length} | Errors: ${errors.length}`,
-              ];
-
-              if (deleted.length > 0) {
-                lines.push('*Deleted branches:*');
-                lines.push(deleted.map(r => `• \`${r.name}\` (inactive ${r.ageDays} days)`).join('\n'));
-              } else if (!dryRun) {
-                lines.push('_No branches were deleted this run._');
+              if (dryRun) {
+                lines.push(`:mag: Release branch cleanup *dry run* completed in \`${owner}/${repo}\``);
+              } else if (candidates.length > 0) {
+                lines.push(`:hourglass_flowing_sand: Release branch cleanup found *${candidates.length}* branch(es) to delete in \`${owner}/${repo}\` - *awaiting approval*`);
+              } else {
+                lines.push(`:white_check_mark: Release branch cleanup ran in \`${owner}/${repo}\` - nothing to delete this time`);
               }
 
-              if (wouldDelete.length > 0) {
-                lines.push('*Would delete (dry run):*');
-                lines.push(wouldDelete.map(r => `• \`${r.name}\` (inactive ${r.ageDays} days)`).join('\n'));
+              lines.push(`Pattern: \`${pattern}\` | Threshold: ${inactivityDays} days | Matched: ${results.length} | Candidates: ${candidates.length}`);
+
+              if (candidates.length > 0) {
+                lines.push(dryRun ? '*Would delete (dry run):*' : '*Pending deletion (needs approval):*');
+                lines.push(candidates.map(c => `• \`${c.name}\` (inactive ${c.ageDays} days)`).join('\n'));
               }
 
-              if (errors.length > 0) {
-                lines.push('*Errors:*');
-                lines.push(errors.map(r => `• \`${r.name}\`: ${r.reason}`).join('\n'));
-              }
-
-              lines.push(`<${runUrl}|View full run details>`);
+              lines.push(!dryRun && candidates.length > 0
+                ? `<${runUrl}|Review and approve/reject this run>`
+                : `<${runUrl}|View full run details>`);
 
               try {
                 const resp = await fetch(webhookUrl, {
@@ -203,21 +184,114 @@ jobs:
               }
             }
 
-            if (errors.length > 0) {
-              core.setFailed(`${errors.length} branch deletion(s) failed unexpectedly - see job summary for details.`);
-            }
-
-      # Fallback only: covers a catastrophic failure in the step above (e.g. API/auth
-      # error) that crashes before it reaches its own inline Slack notification.
-      - name: Notify Slack on job-level failure
+      - name: Notify Slack on plan failure
         if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "::notice::SLACK_WEBHOOK_URL secret not set - skipping Slack notification. Failure is still visible in the Actions tab."
+            echo "::notice::SLACK_WEBHOOK_URL secret not set - skipping Slack notification."
             exit 0
           fi
           curl -sf -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\":rotating_light: Release branch cleanup workflow *failed* in ${{ github.repository }} (run <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>). Please investigate.\"}" \
+            --data "{\"text\":\":rotating_light: Release branch cleanup *scan* failed in ${{ github.repository }} (run <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>). Please investigate.\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+  apply:
+    name: Delete approved branches
+    needs: plan
+    if: needs.plan.outputs.dry_run == 'false' && needs.plan.outputs.candidates != '[]'
+    runs-on: ubuntu-latest
+    environment: release-branch-cleanup-approval
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the approved branches
+        uses: actions/github-script@v7
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          CANDIDATES: ${{ needs.plan.outputs.candidates }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const candidates = JSON.parse(process.env.CANDIDATES);
+
+            const deleted = [];
+            const skipped = [];
+            const errors = [];
+
+            for (const name of candidates) {
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${name}` });
+                deleted.push(name);
+              } catch (e) {
+                const msg = e.message || String(e);
+                if (e.status === 404 || e.status === 422 || /protected/i.test(msg)) {
+                  skipped.push({ name, reason: msg });
+                  core.warning(`Skipped ${name}: ${msg}`);
+                } else {
+                  errors.push({ name, reason: msg });
+                  core.error(`Failed to delete ${name}: ${msg}`);
+                }
+              }
+            }
+
+            const summary = core.summary
+              .addHeading('Release Branch Cleanup - Apply (approved)')
+              .addRaw(`**Deleted:** ${deleted.length} | **Skipped:** ${skipped.length} | **Errors:** ${errors.length}\n\n`);
+
+            if (deleted.length > 0) {
+              summary.addRaw('**Deleted branches:**\n' + deleted.map(n => `- \`${n}\``).join('\n') + '\n\n');
+            }
+            if (skipped.length > 0) {
+              summary.addRaw('**Skipped (likely protected):**\n' + skipped.map(s => `- \`${s.name}\`: ${s.reason}`).join('\n') + '\n\n');
+            }
+            if (errors.length > 0) {
+              summary.addRaw('**Errors:**\n' + errors.map(e => `- \`${e.name}\`: ${e.reason}`).join('\n') + '\n\n');
+            }
+            await summary.write();
+
+            const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+            if (webhookUrl) {
+              const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+              const lines = [
+                `:white_check_mark: Release branch cleanup *approved and applied* in \`${owner}/${repo}\``,
+                `Deleted: ${deleted.length} | Skipped: ${skipped.length} | Errors: ${errors.length}`,
+              ];
+              if (deleted.length > 0) {
+                lines.push('*Deleted branches:*');
+                lines.push(deleted.map(n => `• \`${n}\``).join('\n'));
+              }
+              if (errors.length > 0) {
+                lines.push('*Errors:*');
+                lines.push(errors.map(e => `• \`${e.name}\`: ${e.reason}`).join('\n'));
+              }
+              lines.push(`<${runUrl}|View full run details>`);
+              try {
+                const resp = await fetch(webhookUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: lines.join('\n') }),
+                });
+                if (!resp.ok) core.warning(`Slack notification returned ${resp.status}: ${await resp.text()}`);
+              } catch (slackErr) {
+                core.warning(`Slack notification failed: ${slackErr.message || slackErr}`);
+              }
+            }
+
+            if (errors.length > 0) {
+              core.setFailed(`${errors.length} branch deletion(s) failed unexpectedly - see job summary for details.`);
+            }
+
+      - name: Notify Slack on apply failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::notice::SLACK_WEBHOOK_URL secret not set - skipping Slack notification."
+            exit 0
+          fi
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rotating_light: Release branch cleanup *apply step* failed in ${{ github.repository }} (run <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>). Please investigate.\"}" \
             "$SLACK_WEBHOOK_URL"
