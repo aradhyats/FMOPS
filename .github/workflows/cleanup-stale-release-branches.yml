@@ -124,19 +124,36 @@ jobs:
                 `**Always kept:** ${defaultBranch} (default), ${excludeList.join(', ')}  \n\n`
               );
 
-            if (results.length === 0) {
-              summary.addRaw('No branches matched the pattern (after exclusions).\n');
+            if (candidates.length === 0) {
+              summary.addRaw(dryRun
+                ? '_No branches would be deleted this run._\n'
+                : '_Nothing to delete this run - no branches are eligible._\n');
             } else {
-              const rows = [[
+              summary.addHeading(dryRun ? 'Would delete' : 'Pending deletion (needs approval)', 3);
+              const candidateRows = [[
+                { data: 'Branch', header: true },
+                { data: 'Age (days)', header: true },
+              ]];
+              for (const r of candidates) {
+                candidateRows.push([r.name, String(r.ageDays)]);
+              }
+              summary.addTable(candidateRows);
+            }
+
+            const others = results.filter(r => r.status !== 'candidate');
+            if (others.length > 0) {
+              summary.addRaw('\n<details><summary>All other matched branches (kept/skipped) - click to expand</summary>\n\n');
+              const otherRows = [[
                 { data: 'Branch', header: true },
                 { data: 'Age (days)', header: true },
                 { data: 'Status', header: true },
                 { data: 'Reason', header: true },
               ]];
-              for (const r of results) {
-                rows.push([r.name, String(r.ageDays), r.status, r.reason]);
+              for (const r of others) {
+                otherRows.push([r.name, String(r.ageDays), r.status, r.reason]);
               }
-              summary.addTable(rows);
+              summary.addTable(otherRows);
+              summary.addRaw('\n</details>\n');
             }
             await summary.write();
 
