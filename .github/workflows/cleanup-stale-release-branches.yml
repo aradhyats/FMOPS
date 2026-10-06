@@ -17,7 +17,7 @@ on:
       exclude_branches:
         description: "Comma-separated branch names to always keep"
         type: string
-        default: "dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20,releases/sts/v26.10.19"
+        default: "dev,main,master"
       inactivity_days:
         description: "Days of inactivity before a branch is eligible for deletion"
         type: number
@@ -37,7 +37,7 @@ jobs:
       # takes whatever the form/API call supplied, defaulting to 'true'.
       DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || github.event.inputs.dry_run }}
       BRANCH_PATTERN: ${{ github.event.inputs.branch_pattern || 'releases/*' }}
-      EXCLUDE_BRANCHES: ${{ github.event.inputs.exclude_branches || 'dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20,releases/sts/v26.10.19' }}
+      EXCLUDE_BRANCHES: ${{ github.event.inputs.exclude_branches || 'dev,main,master' }}
       INACTIVITY_DAYS: ${{ github.event.inputs.inactivity_days || '365' }}
       MAX_DELETIONS: ${{ github.event.inputs.max_deletions || '0' }}
     outputs:
