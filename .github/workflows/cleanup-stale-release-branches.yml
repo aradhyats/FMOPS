@@ -1,21 +1,5 @@
 name: Cleanup Stale Release Branches
 
-# FMOPS-3389: delete release branches with no commits in the last 12 months.
-# The repo's default branch is always skipped. Tags are never touched.
-#
-# Two-stage, approval-gated design:
-#   1. `plan` always runs first: scans branches, posts the candidate list to
-#      Slack and the Job Summary, but NEVER deletes anything itself.
-#   2. `apply` only runs when there is something to delete AND it is not a
-#      dry run. It is gated behind the `release-branch-cleanup-approval`
-#      GitHub Environment, which requires a human reviewer to approve the
-#      run (Actions tab -> "Review deployments") before anything is
-#      actually deleted - including on the automatic monthly schedule.
-#
-# One-time setup needed: create an Environment named
-# `release-branch-cleanup-approval` in Settings -> Environments, with
-# "Required reviewers" turned on and the right people/team added.
-
 on:
   schedule:
     # 06:00 UTC on the 1st of every month
@@ -33,7 +17,7 @@ on:
       exclude_branches:
         description: "Comma-separated branch names to always keep"
         type: string
-        default: "dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20"
+        default: "dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20,releases/sts/v26.10.19"
       inactivity_days:
         description: "Days of inactivity before a branch is eligible for deletion"
         type: number
@@ -53,7 +37,7 @@ jobs:
       # takes whatever the form/API call supplied, defaulting to 'true'.
       DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || github.event.inputs.dry_run }}
       BRANCH_PATTERN: ${{ github.event.inputs.branch_pattern || 'releases/*' }}
-      EXCLUDE_BRANCHES: ${{ github.event.inputs.exclude_branches || 'dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20' }}
+      EXCLUDE_BRANCHES: ${{ github.event.inputs.exclude_branches || 'dev,main,master,releases/lts/v26.07.20,releases/sts/v26.04.20,releases/sts/v26.10.19' }}
       INACTIVITY_DAYS: ${{ github.event.inputs.inactivity_days || '365' }}
       MAX_DELETIONS: ${{ github.event.inputs.max_deletions || '0' }}
     outputs:
@@ -90,9 +74,15 @@ jobs:
             for (const b of branches) {
               const name = b.name;
 
-              if (name === defaultBranch) continue;
-              if (excludeList.includes(name.toLowerCase())) continue;
-              if (!patternRegex.test(name)) continue;
+              if (name === defaultBranch) {
+                continue;
+              }
+              if (excludeList.includes(name.toLowerCase())) {
+                continue;
+              }
+              if (!patternRegex.test(name)) {
+                continue;
+              }
 
               const commit = await github.rest.repos.getCommit({ owner, repo, ref: b.commit.sha });
               const commitDateStr = commit.data.commit.committer.date || commit.data.commit.author.date;
